@@ -706,6 +706,8 @@ export interface DownloadFile {
 export interface DownloadRequest {
   repo: string;
   files: DownloadFile[];
+  /** Build a .jns copy with the Janas converter when the download finishes. */
+  auto_compile?: boolean;
 }
 
 export interface DownloadStarted {
@@ -851,6 +853,57 @@ export interface ProjectIngest {
   truncated: boolean;
 }
 
+export type GpuBackend = "cuda" | "rocm" | "vulkan" | "metal" | "none";
+
+/** The machine the fit estimator measured, cached by the backend. */
+export interface HardwareProfile {
+  os: string;
+  arch: string;
+  cpu: string;
+  cpu_avx2: boolean;
+  ram_total_bytes: number;
+  /** 0 when the platform does not expose free memory. */
+  ram_available_bytes: number;
+  gpu_backend: GpuBackend;
+  gpu_name: string | null;
+  vram_total_bytes: number;
+  /** 0 when the driver publishes no used-bytes counter. */
+  vram_free_bytes: number;
+  /** Sequential MB/s from the last `benchmark_storage` run, if any. */
+  storage_mb_s: number | null;
+  detected_at_ms: number;
+}
+
+export type FitTier =
+  | "fits_vram"
+  | "ram_gpu_split"
+  | "requires_ssd_streaming"
+  | "tight_or_slow";
+
+export interface ModelFitEstimate {
+  tier: FitTier;
+  /** Short badge text, e.g. "Fits VRAM". */
+  label: string;
+  /** The RAM/VRAM arithmetic behind the badge. */
+  reason: string;
+  file_size_bytes: number;
+  kv_cache_bytes: number;
+  runtime_overhead_bytes: number;
+  total_needed_bytes: number;
+  /** Layer count the estimate used, when the header was readable. */
+  block_count: number | null;
+  recommended_gpu_layers: number;
+  recommended_ctx_size: number;
+  uses_ssd_streaming: boolean;
+}
+
+export interface AutoTuneResult {
+  settings: AppSettings;
+  notice: string;
+  /** True when the model needs janas-server instead of llama.cpp. */
+  requires_engine_switch: boolean;
+}
+
 export interface LibraryModel {
   name: string;
   path: string;
@@ -867,6 +920,8 @@ export interface LibraryModel {
   capabilities_source: string;
   duplicate: boolean;
   same_repo_count: number;
+  /** VRAM/RAM verdict for this file on this machine. */
+  fit: ModelFitEstimate;
 }
 
 export type ModelRole = "main_llm" | "vision_main" | "mmproj" | "draft_candidate";

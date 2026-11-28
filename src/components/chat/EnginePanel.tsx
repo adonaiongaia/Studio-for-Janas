@@ -217,6 +217,9 @@ export function EnginePanel({
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const [tuning, setTuning] = useState(false);
+  const [tuneNotice, setTuneNotice] = useState<string | null>(null);
+  const [tuneSwitch, setTuneSwitch] = useState(false);
   const [personaId, setPersonaId] = useState("");
   const [personaOpen, setPersonaOpen] = useState(false);
   const [personaName, setPersonaName] = useState("");
@@ -292,6 +295,31 @@ export function EnginePanel({
       await onReset(defaults);
     } finally {
       setResetting(false);
+    }
+  };
+
+  /**
+   * One click: measure the active model against this machine and write the
+   * GPU layers, context and Flash Attention it can actually sustain. A model
+   * above system RAM is left untouched and the notice offers Janas instead.
+   */
+  const autoTune = async () => {
+    if (!settings || tuning) return;
+    const modelPath =
+      activeEngine === "llama" ? settings.llama_model_path : settings.model_path;
+    setTuning(true);
+    setTuneNotice(null);
+    setTuneSwitch(false);
+    try {
+      const result = await api.autoTuneForModel(modelPath || null);
+      setForm(formFrom(result.settings));
+      setTuneNotice(result.notice);
+      setTuneSwitch(result.requires_engine_switch);
+      await onApplyEngineSettings(result.settings);
+    } catch (err) {
+      setTuneNotice(errorMessage(err));
+    } finally {
+      setTuning(false);
     }
   };
 
@@ -398,6 +426,50 @@ export function EnginePanel({
           streaming={streaming}
           startedAtMs={startedAtMs}
         />
+
+        <div className="rounded-xl border border-acid-400/20 bg-acid-400/[0.04] px-3 py-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <p className="flex items-center gap-1.5 text-[10.5px] font-medium text-acid-200">
+              <Zap className="h-3 w-3" /> Hardware fit
+            </p>
+            <button
+              type="button"
+              onClick={() => void autoTune()}
+              disabled={tuning || !settings}
+              title="Set GPU layers, context size and Flash Attention from this machine's RAM and VRAM"
+              className="inline-flex items-center gap-1 rounded-lg border border-acid-400/30 bg-acid-400/10 px-2 py-1 text-[9.5px] font-medium text-acid-200 transition hover:bg-acid-400/20 disabled:opacity-40"
+            >
+              {tuning ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                <Zap className="h-3 w-3" />
+              )}
+              Auto-Tune
+            </button>
+          </div>
+          <p className="mt-1 text-[9px] leading-4 text-slate-500">
+            Reads RAM, VRAM and the active model header, then sets{" "}
+            <span className="font-mono">--n-gpu-layers</span>, context and Flash
+            Attention. A model larger than RAM is left alone so Janas can stream
+            it.
+          </p>
+          {tuneNotice ? (
+            <div className="mt-2 rounded-lg border border-white/5 bg-ink-950/50 px-2 py-1.5">
+              <p className="text-[9.5px] leading-4 text-slate-300">
+                {tuneNotice}
+              </p>
+              {tuneSwitch ? (
+                <button
+                  type="button"
+                  onClick={() => void onSwitchEngine("janas")}
+                  className="mt-1 text-[9px] font-medium text-acid-300 underline-offset-2 transition hover:underline"
+                >
+                  Switch to Janas
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
 
         <section className="space-y-2">
           <SectionTitle>Engine</SectionTitle>

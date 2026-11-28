@@ -29,6 +29,7 @@ import type {
 } from "../../types";
 import { Button } from "../ui/Button";
 import { CompanionDrawer } from "./CompanionDrawer";
+import { FitBadge } from "./FitBadge";
 
 interface ModelLibraryViewProps {
   onUseModel: (path: string) => Promise<void>;
@@ -160,7 +161,7 @@ export function ModelLibraryView({ onUseModel }: ModelLibraryViewProps) {
     return models.filter((model) =>
       `${model.name} ${model.architecture} ${model.quant} ${model.publisher} ${
         model.repo ?? ""
-      } ${model.thinking ? "thinking reasoning" : ""} ${
+      } ${model.fit.label} ${model.thinking ? "thinking reasoning" : ""} ${
         model.tools ? "tools tool calling" : ""
       }`
         .toLowerCase()
@@ -273,8 +274,11 @@ export function ModelLibraryView({ onUseModel }: ModelLibraryViewProps) {
                           )}`
                         : ""}
                     </p>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1">
+                      <FitBadge fit={model.fit} />
+                    </div>
                     {model.thinking || model.tools ? (
-                      <div className="mt-1.5 flex flex-wrap items-center gap-1">
+                      <div className="mt-1 flex flex-wrap items-center gap-1">
                         {model.thinking ? (
                           <CapabilityBadge
                             icon={Brain}

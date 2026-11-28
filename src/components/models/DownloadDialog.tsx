@@ -4,6 +4,7 @@ import {
   Download,
   Eye,
   FolderTree,
+  HardDrive,
   Pause,
   Play,
   Sparkles,
@@ -19,16 +20,27 @@ import type {
   HfMmprojFile,
   HfModel,
   HfQuant,
+  HardwareProfile,
+  ModelFitEstimate,
 } from "../../types";
 import { Button } from "../ui/Button";
 import { ProgressBar } from "../ui/ProgressBar";
+import { FitBadge } from "./FitBadge";
 
 interface DownloadDialogProps {
   model: HfModel;
   modelsDir: string;
   downloads: Record<string, DownloadProgress>;
+  /** This machine's RAM/VRAM, fetched by the explorer on mount. */
+  hardware: HardwareProfile | null;
+  /** The llama.cpp context to estimate the KV cache at, when configured. */
+  contextSize: number | null;
   onClose: () => void;
-  onDownload: (quant: HfQuant, mmproj?: HfMmprojFile) => Promise<string>;
+  onDownload: (
+    quant: HfQuant,
+    mmproj?: HfMmprojFile,
+    autoCompile?: boolean,
+  ) => Promise<string>;
   onPause: (id: string) => void;
   onResume: (id: string) => void;
   onCancel: (id: string) => void;
@@ -38,6 +50,8 @@ export function DownloadDialog({
   model,
   modelsDir,
   downloads,
+  hardware,
+  contextSize,
   onClose,
   onDownload,
   onPause,
@@ -57,6 +71,8 @@ export function DownloadDialog({
   const [error, setError] = useState<string | null>(null);
   const [downloadId, setDownloadId] = useState<string | null>(null);
   const [freeBytes, setFreeBytes] = useState<number | null>(null);
+  const [fits, setFits] = useState<Record<string, ModelFitEstimate>>({});
+  const [autoCompile, setAutoCompile] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -102,6 +118,44 @@ export function DownloadDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model.id]);
 
+  // Every quantization row gets a hardware verdict. The Hub metadata has no
+  // GGUF header, so the backend infers a block count from `parameters`.
+  useEffect(() => {
+    if (!quants.length) {
+      setFits({});
+      return;
+    }
+    let cancelled = false;
+    void Promise.all(
+      quants.map(async (quant) => {
+        try {
+          const estimate = await api.estimateQuantFit(
+            quant.size_bytes,
+            null,
+            contextSize,
+            model.parameters,
+          );
+          return [quant.quant, estimate] as const;
+        } catch {
+          return null;
+        }
+      }),
+    ).then((entries) => {
+      if (cancelled) return;
+      setFits(
+        Object.fromEntries(
+          entries.filter(
+            (entry): entry is readonly [string, ModelFitEstimate] =>
+              entry !== null,
+          ),
+        ),
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [quants, model.parameters, contextSize]);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !starting) onClose();
@@ -121,6 +175,12 @@ export function DownloadDialog({
   const chosenMmproj = includeMmproj ? mmproj : undefined;
   const combinedBytes =
     (active?.size_bytes ?? 0) + (chosenMmproj?.size ?? 0);
+  const activeFit = active ? fits[active.quant] ?? null : null;
+  // Both tiers above the RAM budget need Janas SSD streaming; the slow one is
+  // the same situation with a warning attached.
+  const exceedsRam =
+    activeFit?.tier === "requires_ssd_streaming" ||
+    activeFit?.tier === "tight_or_slow";
 
   const job = downloadId ? downloads[downloadId] : undefined;
   const running = job ? ["preparing", "downloading"].includes(job.status) : false;
@@ -136,7 +196,11 @@ export function DownloadDialog({
     setStarting(true);
     setError(null);
     try {
-      const id = await onDownload(active, chosenMmproj);
+      const id = await onDownload(
+        active,
+        chosenMmproj,
+        autoCompile && exceedsRam,
+      );
       setDownloadId(id);
     } catch (err) {
       setError(errorMessage(err));
@@ -246,8 +310,7 @@ export function DownloadDialog({
                 ) : null}
                 {finished ? (
                   <p className="text-[10px] leading-4 text-emerald-300/80">
-                    Main weights and any projector are in your models folder.
-                    Pair them in Library.
+                    {job?.message || "Download complete."}
                   </p>
                 ) : null}
                 {job.status === "error" ? (
@@ -304,9 +367,12 @@ export function DownloadDialog({
                           {quant.files.length === 1 ? "" : "s"}
                         </p>
                       </div>
-                      <span className="shrink-0 font-mono text-[10px] text-slate-400">
-                        {formatBytes(quant.size_bytes)}
-                      </span>
+                      <div className="flex shrink-0 flex-col items-end gap-1">
+                        <span className="font-mono text-[10px] text-slate-400">
+                          {formatBytes(quant.size_bytes)}
+                        </span>
+                        <FitBadge fit={fits[quant.quant] ?? null} />
+                      </div>
                     </button>
                   ))
                 ) : (
@@ -386,6 +452,29 @@ export function DownloadDialog({
                 ) : null}
               </div>
 
+              {exceedsRam ? (
+                <label className="flex items-start gap-2 rounded-xl border border-amber-400/25 bg-amber-400/5 px-3 py-2.5">
+                  <input
+                    type="checkbox"
+                    checked={autoCompile}
+                    onChange={(event) => setAutoCompile(event.target.checked)}
+                    className="mt-0.5 h-3.5 w-3.5 accent-current text-amber-300"
+                  />
+                  <span className="min-w-0">
+                    <span className="flex items-center gap-1.5 text-[11px] font-medium text-amber-200">
+                      <HardDrive className="h-3 w-3" />
+                      Auto-compile to .jns after download for Janas SSD streaming
+                    </span>
+                    <span className="mt-0.5 block text-[9.5px] leading-4 text-slate-500">
+                      This build needs {formatBytes(activeFit?.total_needed_bytes ?? 0)} of
+                      working memory and exceeds system RAM. When the download
+                      finishes it is compiled with the Janas converter so
+                      janas-server can stream it from the SSD.
+                    </span>
+                  </span>
+                </label>
+              ) : null}
+
               {active ? (
                 <>
                   <div className="rounded-xl border border-white/5 bg-ink-950/50 px-3 py-2.5">
@@ -435,24 +524,53 @@ export function DownloadDialog({
                         {formatBytes(combinedBytes)} on disk
                       </span>
                     </div>
-                    <div className="mt-2 grid grid-cols-2 gap-2">
-                      <MemoryStat
-                        label="System RAM"
-                        value={formatBytes(combinedBytes * 1.15 + 1.5 * 1024 ** 3)}
-                        hint="working set at load"
-                      />
-                      <MemoryStat
-                        label="VRAM"
-                        value={formatBytes(combinedBytes * 1.05)}
-                        hint="if fully offloaded"
-                      />
-                    </div>
-                    <p className="mt-1.5 text-[9px] leading-4 text-slate-600">
-                      Rough estimate: weights{chosenMmproj ? ", projector" : ""}{" "}
-                      and a 1.5 GiB margin for the KV cache and runtime. A
-                      mixture-of-experts model streams unused experts from disk,
-                      so resident RAM can be far lower.
-                    </p>
+                    {activeFit ? (
+                      <div className="mt-2 flex items-start gap-2">
+                        <FitBadge fit={activeFit} />
+                        <p className="text-[9.5px] leading-4 text-slate-500">
+                          {activeFit.reason}
+                        </p>
+                      </div>
+                    ) : null}
+                    {hardware ? (
+                      <p className="mt-1.5 text-[9px] leading-4 text-slate-600">
+                        Detected:{" "}
+                        {hardware.vram_total_bytes > 0
+                          ? `${formatBytes(hardware.vram_total_bytes)} VRAM`
+                          : hardware.gpu_backend === "none"
+                            ? "no GPU"
+                            : "VRAM unknown"}
+                        {` · ${formatBytes(hardware.ram_total_bytes)} RAM`}
+                        {hardware.storage_mb_s != null
+                          ? ` · ${Math.round(hardware.storage_mb_s)} MB/s storage`
+                          : ""}
+                      </p>
+                    ) : null}
+                    {activeFit ? null : (
+                      <>
+                        <div className="mt-2 grid grid-cols-2 gap-2">
+                          <MemoryStat
+                            label="System RAM"
+                            value={formatBytes(
+                              combinedBytes * 1.15 + 1.5 * 1024 ** 3,
+                            )}
+                            hint="working set at load"
+                          />
+                          <MemoryStat
+                            label="VRAM"
+                            value={formatBytes(combinedBytes * 1.05)}
+                            hint="if fully offloaded"
+                          />
+                        </div>
+                        <p className="mt-1.5 text-[9px] leading-4 text-slate-600">
+                          Rough estimate: weights
+                          {chosenMmproj ? ", projector" : ""} and a 1.5 GiB
+                          margin for the KV cache and runtime. A
+                          mixture-of-experts model streams unused experts from
+                          disk, so resident RAM can be far lower.
+                        </p>
+                      </>
+                    )}
                   </div>
                 </>
               ) : null}

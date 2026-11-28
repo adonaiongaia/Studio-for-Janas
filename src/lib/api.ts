@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   ActiveEngineInfo,
   AgentApprovalReply,
+  AutoTuneResult,
   AgentRunRequest,
   AgentUndoResult,
   AppSettings,
@@ -23,6 +24,8 @@ import type {
   EngineSnapshot,
   GatewayStatus,
   GgufModelInfo,
+  HardwareProfile,
+  ModelFitEstimate,
   HfModel,
   HfQuant,
   HfRepoBundles,
@@ -297,6 +300,28 @@ export const api = {
     invoke<boolean>("cancel_whisper_download"),
   libraryModels: () => invoke<LibraryModel[]>("library_models"),
   libraryDisk: () => invoke<LibraryDisk>("library_disk"),
+  getHardwareProfile: () => invoke<HardwareProfile>("get_hardware_profile"),
+  /**
+   * Estimate one quantization against this machine. `block_count` comes from a
+   * GGUF header when one is available; otherwise the backend infers layers
+   * from `parameters`. `context_size` null keeps the backend default.
+   */
+  estimateQuantFit: (
+    fileSizeBytes: number,
+    blockCount: number | null,
+    contextSize: number | null,
+    parameters: number | null,
+  ) =>
+    invoke<ModelFitEstimate>("estimate_quant_fit", {
+      file_size_bytes: fileSizeBytes,
+      block_count: blockCount,
+      context_size: contextSize,
+      parameters,
+    }),
+  autoTuneForModel: (modelPath: string | null) =>
+    invoke<AutoTuneResult>("auto_tune_for_model", {
+      model_path: modelPath,
+    }),
   verifyLocalModel: (path: string) =>
     invoke<ModelVerification>("verify_local_model", { path }),
   deleteLocalModel: (path: string) =>

@@ -80,6 +80,12 @@ export function basename(path: string): string {
   return normalized.slice(normalized.lastIndexOf("/") + 1);
 }
 
+export function dirname(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  const index = normalized.lastIndexOf("/");
+  return index > 0 ? normalized.slice(0, index) : ".";
+}
+
 export function stripExtension(name: string): string {
   const index = name.lastIndexOf(".");
   return index > 0 ? name.slice(0, index) : name;

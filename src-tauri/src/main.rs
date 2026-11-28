@@ -12,6 +12,7 @@ mod engines;
 #[cfg(test)]
 mod dual_engine_harness;
 mod error;
+mod fit;
 mod gateway;
 mod gguf;
 mod huggingface;
@@ -764,6 +765,9 @@ fn main() {
             engines::binary::probe_managed_binary,
             provision::get_engine_setup_status,
             provision::rerun_engine_setup,
+            fit::get_hardware_profile,
+            fit::estimate_quant_fit,
+            fit::auto_tune_for_model,
             agent::agent_start,
             agent::agent_resolve_approval,
             agent::agent_approval_rules,

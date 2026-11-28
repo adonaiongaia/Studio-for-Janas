@@ -11,12 +11,13 @@ use std::{
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
+    converter::{ConvertRequest, ConverterManager},
     error::{AppError, AppResult},
-    settings::AppSettings,
+    settings::{AppSettings, SettingsStore},
 };
 
 const USER_AGENT: &str = "Studio-for-Janas/0.1 (+https://github.com/prabanta-dev/janas)";
@@ -576,6 +577,9 @@ pub struct DownloadFile {
 pub struct DownloadRequest {
     pub repo: String,
     pub files: Vec<DownloadFile>,
+    /// Build a `.jns` copy with the Janas converter once every file verifies.
+    #[serde(default)]
+    pub auto_compile: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -643,6 +647,7 @@ impl DownloadManager {
         let files = request.files.clone();
         let destination = PathBuf::from(settings.models_dir.trim());
         let token = settings.hf_token.trim().to_string();
+        let auto_compile = request.auto_compile;
         let task_id = id.clone();
         let app_handle = app.clone();
 
@@ -669,6 +674,7 @@ impl DownloadManager {
                 files,
                 destination,
                 token,
+                auto_compile,
             )
             .await;
             manager.finish(&task_id);
@@ -730,6 +736,7 @@ async fn run_download(
     files: Vec<DownloadFile>,
     models_dir: PathBuf,
     token: String,
+    auto_compile: bool,
 ) {
     let files_total = files.len();
     let known_total: Option<u64> = if files.iter().all(|file| file.size > 0) {
@@ -1090,6 +1097,21 @@ async fn run_download(
         );
     }
 
+    // The conversion belongs to the job, not the view that started it: the
+    // dialog can close and the user can switch tabs while this runs.
+    let message = if auto_compile {
+        let note = match auto_compile_download(&app, &root, &files) {
+            AutoCompile::Started { file } => format!(
+                " Compiling {file} to .jns for Janas SSD streaming — progress is in the Compiler tab."
+            ),
+            AutoCompile::Failed(reason) => format!(" The .jns build could not start: {reason}"),
+            AutoCompile::Skipped => " No .gguf file was found to compile.".to_string(),
+        };
+        format!("Downloaded {files_total} file(s).{note}")
+    } else {
+        format!("Downloaded {files_total} file(s) to the models folder. Pair them in Library.")
+    };
+
     emit_progress(
         &app,
         DownloadProgress {
@@ -1102,7 +1124,7 @@ async fn run_download(
             files_done: files_total,
             files_total,
             status: "complete".into(),
-            message: format!("Downloaded {files_total} file(s). Convert them to .jns in the Compiler tab."),
+            message,
             saved_path: Some(root.to_string_lossy().to_string()),
         },
     );
@@ -1118,6 +1140,53 @@ async fn run_download(
             checksums,
         },
     );
+}
+
+/// What a finished download does with its `.jns` request.
+enum AutoCompile {
+    Started { file: String },
+    Failed(String),
+    /// The job had nothing convertible (for example only a projector).
+    Skipped,
+}
+
+/// The main weights of a finished download: the first `.gguf` the job fetched.
+/// The explorer requests the quantization's file before any projector, so this
+/// is the file the converter expects.
+fn compile_target(root: &Path, files: &[DownloadFile]) -> Option<(PathBuf, PathBuf)> {
+    let file = files
+        .iter()
+        .find(|file| file.path.to_ascii_lowercase().ends_with(".gguf"))?;
+    let input = root.join(safe_relative(&file.path).ok()?);
+    let output = input.with_extension("jns");
+    Some((input, output))
+}
+
+/// Hand a verified download to the Janas converter. Both managers are app
+/// state, so this runs from the download task with no UI involved.
+fn auto_compile_download(app: &AppHandle, root: &Path, files: &[DownloadFile]) -> AutoCompile {
+    let Some((input, output)) = compile_target(root, files) else {
+        return AutoCompile::Skipped;
+    };
+    let (Some(converter), Some(store)) = (
+        app.try_state::<Arc<ConverterManager>>(),
+        app.try_state::<Arc<SettingsStore>>(),
+    ) else {
+        return AutoCompile::Failed("the converter is not available".into());
+    };
+    let file = input
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| input.to_string_lossy().to_string());
+    let request = ConvertRequest {
+        input: input.to_string_lossy().to_string(),
+        output: output.to_string_lossy().to_string(),
+        overwrite: false,
+    };
+    match converter.start(app, &store.get(), request) {
+        Ok(_) => AutoCompile::Started { file },
+        Err(err) => AutoCompile::Failed(err.to_string()),
+    }
 }
 
 fn quant_from_files(files: &[DownloadFile]) -> String {
@@ -1523,5 +1592,38 @@ mod tests {
     #[test]
     fn timestamps_are_available() {
         assert!(now_ms() > 0);
+    }
+
+    #[test]
+    fn compiles_the_first_gguf_of_a_finished_download() {
+        let root = Path::new("/models/org/repo");
+        let files = [
+            DownloadFile {
+                path: "Qwen-Q4_K_M.gguf".into(),
+                size: 1,
+            },
+            DownloadFile {
+                path: "mmproj-F16.gguf".into(),
+                size: 1,
+            },
+        ];
+        let (input, output) = compile_target(root, &files).expect("a target");
+        assert_eq!(input, root.join("Qwen-Q4_K_M.gguf"));
+        assert_eq!(output, root.join("Qwen-Q4_K_M.jns"));
+    }
+
+    #[test]
+    fn skips_jobs_with_nothing_to_compile() {
+        assert!(compile_target(Path::new("/models"), &[]).is_none());
+        let readme = [DownloadFile {
+            path: "README.md".into(),
+            size: 1,
+        }];
+        assert!(compile_target(Path::new("/models"), &readme).is_none());
+        let escape = [DownloadFile {
+            path: "../escape.gguf".into(),
+            size: 1,
+        }];
+        assert!(compile_target(Path::new("/models"), &escape).is_none());
     }
 }

@@ -419,6 +419,231 @@ pub struct StorageBenchmark {
     pub advice: String,
 }
 
+static LAST_STORAGE_BENCH: std::sync::OnceLock<Mutex<Option<StorageBenchmark>>> =
+    std::sync::OnceLock::new();
+
+fn last_storage_bench() -> &'static Mutex<Option<StorageBenchmark>> {
+    LAST_STORAGE_BENCH.get_or_init(|| Mutex::new(None))
+}
+
+/// The most recent 64 MB benchmark, when one has run this session. The fit
+/// estimator uses its sequential figure to tell a fast NVMe from a drive that
+/// would make SSD streaming painful.
+pub fn last_storage_benchmark() -> Option<StorageBenchmark> {
+    last_storage_bench()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+/// Total and currently available system RAM. Available is 0 on platforms that
+/// do not expose it (the fit estimator treats 0 as "use total").
+pub fn memory_snapshot() -> (u64, u64) {
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        let total = parse_kib_field(&meminfo, "MemTotal:").unwrap_or(0);
+        let available = parse_kib_field(&meminfo, "MemAvailable:").unwrap_or(0);
+        if total > 0 {
+            return (total, available);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = Command::new("sysctl").args(["-n", "hw.memsize"]).output() {
+            if let Ok(total) = String::from_utf8_lossy(&output.stdout).trim().parse::<u64>() {
+                if total > 0 {
+                    return (total, 0);
+                }
+            }
+        }
+    }
+    (0, 0)
+}
+
+/// Which GPU's memory a caller needs. Hybrid laptops expose at least two DRM
+/// cards, and an iGPU's small carve-out must never stand in for a discrete
+/// card, so the caller names the backend it detected. Cards are only summed
+/// across multiple devices of that same vendor (a multi-GPU CUDA/ROCm rig).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VramPreference {
+    Cuda,
+    Rocm,
+    /// No backend match: report the largest single card.
+    Any,
+}
+
+/// One DRM card that publishes a VRAM counter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VramDevice {
+    /// "nvidia", "amd", "intel" or "unknown".
+    pub vendor: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+}
+
+impl VramDevice {
+    fn free_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.used_bytes)
+    }
+}
+
+/// Every DRM card that publishes a VRAM counter, with its vendor. The vendor
+/// comes from the PCI id, falling back to the kernel driver name.
+pub fn vram_devices() -> Vec<VramDevice> {
+    vram_devices_in(Path::new("/sys/class/drm"))
+}
+
+fn vram_devices_in(root: &Path) -> Vec<VramDevice> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .map(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with("card")
+                        && name
+                            .chars()
+                            .skip(4)
+                            .all(|character| character.is_ascii_digit())
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    paths.sort();
+
+    let mut devices = Vec::new();
+    for path in paths {
+        let device = path.join("device");
+        let total = read_sysfs_number(&device.join("mem_info_vram_total").to_string_lossy())
+            .map(|value| value as u64)
+            .unwrap_or(0);
+        if total == 0 {
+            continue;
+        }
+        let used = read_sysfs_number(&device.join("mem_info_vram_used").to_string_lossy())
+            .map(|value| value as u64)
+            .unwrap_or(0);
+        devices.push(VramDevice {
+            vendor: device_vendor(&device),
+            total_bytes: total,
+            used_bytes: used.min(total),
+        });
+    }
+    devices
+}
+
+fn device_vendor(device: &Path) -> String {
+    if let Some(raw) = read_to_string(&device.join("vendor").to_string_lossy()) {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "0x10de" => return "nvidia".into(),
+            "0x1002" => return "amd".into(),
+            "0x8086" => return "intel".into(),
+            _ => {}
+        }
+    }
+    let Some(uevent) = read_to_string(&device.join("uevent").to_string_lossy()) else {
+        return "unknown".into();
+    };
+    let Some(driver) = uevent
+        .lines()
+        .find_map(|line| line.strip_prefix("DRIVER="))
+    else {
+        return "unknown".into();
+    };
+    match driver.trim().to_ascii_lowercase().as_str() {
+        "nvidia" | "nvidia-drm" => "nvidia".into(),
+        "amdgpu" | "radeon" => "amd".into(),
+        "i915" | "xe" => "intel".into(),
+        _ => "unknown".into(),
+    }
+}
+
+/// The budget for one backend. `(0, 0)` means no card of that vendor publishes
+/// counters, so the caller must try another source instead of borrowing a
+/// different GPU's memory.
+pub fn select_vram(devices: &[VramDevice], preference: VramPreference) -> (u64, u64) {
+    let wanted = match preference {
+        VramPreference::Cuda => Some("nvidia"),
+        VramPreference::Rocm => Some("amd"),
+        VramPreference::Any => None,
+    };
+    if let Some(vendor) = wanted {
+        let mut total = 0u64;
+        let mut free = 0u64;
+        let mut matched = false;
+        for device in devices.iter().filter(|device| device.vendor == vendor) {
+            matched = true;
+            total = total.saturating_add(device.total_bytes);
+            free = free.saturating_add(device.free_bytes());
+        }
+        return if matched { (total, free) } else { (0, 0) };
+    }
+    devices
+        .iter()
+        .max_by_key(|device| device.total_bytes)
+        .map(|device| (device.total_bytes, device.free_bytes()))
+        .unwrap_or((0, 0))
+}
+
+/// Total and free VRAM for one backend. The DRM sysfs counters cover `amdgpu`,
+/// `i915` and the NVIDIA proprietary driver; a driver that hides them (an
+/// older driver, a sandboxed sysfs, a MIG-only view) is queried through
+/// `nvidia-smi` instead, so a real GPU never looks like it has no memory.
+pub fn vram_snapshot(preference: VramPreference) -> (u64, u64) {
+    let selected = select_vram(&vram_devices(), preference);
+    if selected.0 > 0 {
+        return selected;
+    }
+    // `nvidia-smi` only ever speaks for NVIDIA. Asking it for a ROCm budget
+    // would hand an AMD backend someone else's card.
+    if preference == VramPreference::Rocm {
+        return (0, 0);
+    }
+    nvidia_smi_vram().unwrap_or((0, 0))
+}
+
+/// Sum `nvidia-smi`'s per-GPU memory counters. Values are MiB; a device that
+/// reports `[N/A]` or `[Not Supported]` is skipped rather than counted as 0.
+fn parse_nvidia_smi_memory(text: &str) -> (u64, u64) {
+    const MIB: u64 = 1024 * 1024;
+    let mut total_mib = 0u64;
+    let mut used_mib = 0u64;
+    for line in text.lines() {
+        let mut fields = line.split(',').map(str::trim);
+        let (Some(total), Some(used)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Ok(total) = total.parse::<u64>() else {
+            continue;
+        };
+        let used = used.parse::<u64>().unwrap_or(0).min(total);
+        total_mib = total_mib.saturating_add(total);
+        used_mib = used_mib.saturating_add(used);
+    }
+    (
+        total_mib.saturating_mul(MIB),
+        total_mib.saturating_sub(used_mib).saturating_mul(MIB),
+    )
+}
+
+fn nvidia_smi_vram() -> Option<(u64, u64)> {
+    let text = crate::provision::run_short(
+        "nvidia-smi",
+        &[
+            "--query-gpu=memory.total,memory.used",
+            "--format=csv,noheader,nounits",
+        ],
+        Duration::from_secs(3),
+    )?;
+    let snapshot = parse_nvidia_smi_memory(&text);
+    (snapshot.0 > 0).then_some(snapshot)
+}
+
 fn bench_seq_read(file: &mut File, size: u64) -> std::io::Result<f64> {
     file.seek(SeekFrom::Start(0))?;
     let mut buffer = vec![0u8; 1024 * 1024];
@@ -483,7 +708,10 @@ pub async fn benchmark_storage(
         .map_err(|err| AppError::message(format!("The benchmark stopped: {err}")))?
 }
 
-fn run_benchmark(target: PathBuf) -> AppResult<StorageBenchmark> {
+/// The 64 MB sequential/random pass behind `benchmark_storage`. It also stores
+/// its result for the hardware fit estimator, so this is `pub(crate)` for the
+/// manual hardware diagnostic.
+pub(crate) fn run_benchmark(target: PathBuf) -> AppResult<StorageBenchmark> {
     fs::create_dir_all(&target)?;
     let path = target.join(format!(".janas-bench-{}.bin", std::process::id()));
     let size: u64 = 64 * 1024 * 1024;
@@ -525,7 +753,7 @@ fn run_benchmark(target: PathBuf) -> AppResult<StorageBenchmark> {
         "This drive will bottleneck large mixtures. Choose a smaller quantization, resident experts, or a faster NVMe drive.".into()
     };
 
-    Ok(StorageBenchmark {
+    let benchmark = StorageBenchmark {
         path: path.to_string_lossy().to_string(),
         file_bytes: size,
         sequential_mb_s,
@@ -538,7 +766,11 @@ fn run_benchmark(target: PathBuf) -> AppResult<StorageBenchmark> {
         },
         elapsed_ms: (started.elapsed().as_millis() as u64).max(elapsed_secs as u64),
         advice,
-    })
+    };
+    if let Ok(mut guard) = last_storage_bench().lock() {
+        *guard = Some(benchmark.clone());
+    }
+    Ok(benchmark)
 }
 
 fn elapsed_from(size: u64, sequential_mb_s: f64, _iops: f64) -> f64 {
@@ -1366,6 +1598,8 @@ pub struct LibraryModel {
     pub duplicate: bool,
     /// How many local files belong to the same Hugging Face repository.
     pub same_repo_count: usize,
+    /// Whether this file fits in VRAM, needs a RAM/GPU split, or must stream.
+    pub fit: crate::fit::ModelFitEstimate,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1436,6 +1670,13 @@ fn infer_quant(name: &str) -> String {
         .find(|token| upper.contains(**token))
         .map(|token| token.to_string())
         .unwrap_or_else(|| "—".into())
+}
+
+/// `GGUF` is the file container, not a quantization, so a recorded value that
+/// says only `GGUF` must not shadow what the header can prove.
+fn is_specific_quant(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty() && trimmed != "—" && !trimmed.eq_ignore_ascii_case("GGUF")
 }
 
 fn infer_architecture(name: &str) -> String {
@@ -1594,6 +1835,31 @@ fn scan_library_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Pick the value shown in the library's Quant column. A recorded download
+/// wins, then the file/repository name, then the GGUF header's dominant tensor
+/// type; `GGUF` is the container, not a quantization, so it never masks a real
+/// value. Non-GGUF files keep the em dash when nothing is known.
+fn choose_quant(
+    record: Option<&str>,
+    inferred: &str,
+    header: Option<&str>,
+    is_gguf: bool,
+) -> String {
+    record
+        .filter(|value| is_specific_quant(value))
+        .map(str::to_string)
+        .or_else(|| is_specific_quant(inferred).then(|| inferred.to_string()))
+        .or_else(|| {
+            if !is_gguf {
+                return None;
+            }
+            header
+                .filter(|value| is_specific_quant(value))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| if is_gguf { "GGUF".into() } else { "—".into() })
+}
+
 /// Reading every GGUF header in the models folder is real disk work, so the
 /// library scan runs on the blocking pool instead of the IPC thread.
 #[tauri::command]
@@ -1611,6 +1877,7 @@ pub(crate) fn library_models_snapshot(store: &SettingsStore) -> Vec<LibraryModel
     scan_library_files(&root, 0, &mut files);
 
     let downloads = read_download_manifest(&root);
+    let hardware = crate::fit::hardware_profile();
     let mut models: Vec<LibraryModel> = files
         .into_iter()
         .map(|path| {
@@ -1639,14 +1906,47 @@ pub(crate) fn library_models_snapshot(store: &SettingsStore) -> Vec<LibraryModel
                 .unwrap_or_else(|| name.clone());
             let (thinking, tools, capabilities_source) =
                 detect_capabilities(features.as_ref(), &haystack);
+            let size_bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            // The manifest only names a quantization for files this app
+            // downloaded, and the repository name often omits it. A GGUF
+            // copied in by hand therefore used to show "—" even though its
+            // header names the dominant tensor type. Prefer, in order: the
+            // recorded download, the file/repository name, then the header.
+            let header_quant = if format == "GGUF" {
+                crate::companions::inspect_gguf_metadata(path.to_string_lossy().as_ref())
+                    .ok()
+                    .map(|info| info.quant)
+            } else {
+                None
+            };
+            let inferred = infer_quant(&format!(
+                "{} {} {}",
+                name,
+                haystack,
+                path.to_string_lossy()
+            ));
+            let quant = choose_quant(
+                record.map(|value| value.quant.as_str()),
+                &inferred,
+                header_quant.as_deref(),
+                format == "GGUF",
+            );
+            let fit = crate::fit::estimate_model_fit(
+                size_bytes,
+                features.as_ref().and_then(|value| value.layer_count),
+                if format == "GGUF" {
+                    settings.llama_ctx_size
+                } else {
+                    settings.ctx_size
+                },
+                &hardware,
+            );
             LibraryModel {
                 name,
-                size_bytes: fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
+                size_bytes,
                 path: path.to_string_lossy().to_string(),
                 format,
-                quant: record
-                    .map(|value| value.quant.clone())
-                    .unwrap_or_else(|| infer_quant(&haystack)),
+                quant,
                 architecture: infer_architecture(&haystack),
                 parameters: infer_parameters(&haystack),
                 publisher: record
@@ -1659,6 +1959,7 @@ pub(crate) fn library_models_snapshot(store: &SettingsStore) -> Vec<LibraryModel
                 capabilities_source,
                 duplicate: false,
                 same_repo_count: 1,
+                fit,
             }
         })
         .collect();
@@ -2010,6 +2311,131 @@ fn launch_external(url: &str) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_nvidia_smi_memory_across_devices() {
+        let (total, free) = parse_nvidia_smi_memory("24576, 512\n24576, 1024\n");
+        assert_eq!(total, 2 * 24_576 * 1024 * 1024);
+        assert_eq!(free, (24_576 * 2 - 1_536) * 1024 * 1024);
+    }
+
+    #[test]
+    fn nvidia_smi_memory_skips_unsupported_counters() {
+        let (total, free) = parse_nvidia_smi_memory("[N/A], [N/A]\n12288, 4096\n");
+        assert_eq!(total, 12_288 * 1024 * 1024);
+        assert_eq!(free, (12_288 - 4_096) * 1024 * 1024);
+
+        // A driver that hides both counters must yield "unknown", not "no GPU".
+        assert_eq!(parse_nvidia_smi_memory("[Not Supported], [N/A]"), (0, 0));
+        // A truncated row must not be counted at all.
+        assert_eq!(parse_nvidia_smi_memory("8192"), (0, 0));
+    }
+
+    fn vram(vendor: &str, total_mib: u64, used_mib: u64) -> VramDevice {
+        const MIB: u64 = 1024 * 1024;
+        VramDevice {
+            vendor: vendor.into(),
+            total_bytes: total_mib * MIB,
+            used_bytes: used_mib * MIB,
+        }
+    }
+
+    #[test]
+    fn cuda_preference_picks_the_discrete_card_on_a_hybrid_laptop() {
+        const MIB: u64 = 1024 * 1024;
+        let devices = [vram("intel", 512, 64), vram("nvidia", 8_188, 1_024)];
+
+        assert_eq!(
+            select_vram(&devices, VramPreference::Cuda),
+            (8_188 * MIB, (8_188 - 1_024) * MIB)
+        );
+        // "Any" must not sum the carve-out into the discrete card either.
+        assert_eq!(
+            select_vram(&devices, VramPreference::Any).0,
+            8_188 * MIB
+        );
+    }
+
+    #[test]
+    fn a_backend_preference_never_borrows_another_vendors_memory() {
+        let devices = [vram("intel", 512, 0)];
+        assert_eq!(select_vram(&devices, VramPreference::Cuda), (0, 0));
+        assert_eq!(select_vram(&devices, VramPreference::Rocm), (0, 0));
+        assert_eq!(select_vram(&devices, VramPreference::Any).0, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn rocm_sums_matching_cards_only() {
+        const MIB: u64 = 1024 * 1024;
+        let devices = [
+            vram("intel", 512, 0),
+            vram("amd", 8_188, 188),
+            vram("amd", 8_188, 188),
+        ];
+        assert_eq!(
+            select_vram(&devices, VramPreference::Rocm),
+            (2 * 8_188 * MIB, 2 * (8_188 - 188) * MIB)
+        );
+    }
+
+    #[test]
+    fn sysfs_scan_finds_the_discrete_card_on_a_hybrid_laptop() {
+        let root = std::env::temp_dir().join(format!("mt-drm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let igpu = root.join("card0/device");
+        fs::create_dir_all(&igpu).unwrap();
+        fs::write(igpu.join("vendor"), "0x8086\n").unwrap();
+        fs::write(igpu.join("mem_info_vram_total"), "536870912\n").unwrap();
+        fs::write(igpu.join("mem_info_vram_used"), "5368709\n").unwrap();
+
+        let dgpu = root.join("card1/device");
+        fs::create_dir_all(&dgpu).unwrap();
+        fs::write(dgpu.join("vendor"), "0x10de\n").unwrap();
+        fs::write(dgpu.join("mem_info_vram_total"), "8589934592\n").unwrap();
+        fs::write(dgpu.join("mem_info_vram_used"), "1073741824\n").unwrap();
+
+        // Vendor only in uevent, as some drivers expose it.
+        let amd = root.join("card2/device");
+        fs::create_dir_all(&amd).unwrap();
+        fs::write(amd.join("uevent"), "DRIVER=amdgpu\n").unwrap();
+        fs::write(amd.join("mem_info_vram_total"), "4294967296\n").unwrap();
+
+        // Connector entries and cards without a counter are not GPUs here.
+        fs::create_dir_all(root.join("card1-DP-1")).unwrap();
+        fs::create_dir_all(root.join("card3/device")).unwrap();
+
+        let devices = vram_devices_in(&root);
+        assert_eq!(devices.len(), 3);
+        assert_eq!(devices[0].vendor, "intel");
+        assert_eq!(devices[1].vendor, "nvidia");
+        assert_eq!(devices[2].vendor, "amd");
+
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(
+            select_vram(&devices, VramPreference::Cuda),
+            (8 * GIB, 7 * GIB)
+        );
+        // The iGPU carve-out is never substituted for a missing NVIDIA card.
+        assert_eq!(select_vram(&devices[..1], VramPreference::Cuda), (0, 0));
+        assert_eq!(select_vram(&devices, VramPreference::Rocm).0, 4 * GIB);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_quant_prefers_a_specific_value_and_falls_back_to_the_header() {
+        // A hand-copied GGUF with a neutral name and no manifest record.
+        assert_eq!(choose_quant(None, "—", Some("Q4_K"), true), "Q4_K");
+        // Older manifests stored the container name; it must not hide the header.
+        assert_eq!(choose_quant(Some("GGUF"), "—", Some("Q5_K"), true), "Q5_K");
+        // The recorded download is the most exact source.
+        assert_eq!(choose_quant(Some("Q4_K_M"), "—", Some("Q4_K"), true), "Q4_K_M");
+        // The file name is more specific than the dominant tensor type.
+        assert_eq!(choose_quant(None, "Q8_0", Some("Q4_K"), true), "Q8_0");
+        // Nothing known at all.
+        assert_eq!(choose_quant(None, "—", None, true), "GGUF");
+        assert_eq!(choose_quant(None, "—", Some("Q4_K"), false), "—");
+    }
 
     #[test]
     fn detects_thinking_and_tool_capabilities_from_templates_and_names() {

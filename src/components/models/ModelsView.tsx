@@ -11,6 +11,7 @@ import type {
   HfMmprojFile,
   HfModel,
   HfQuant,
+  HardwareProfile,
 } from "../../types";
 import { Button } from "../ui/Button";
 import { DownloadDialog } from "./DownloadDialog";
@@ -39,6 +40,20 @@ export function ModelsView({
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [selected, setSelected] = useState<HfModel | null>(null);
+  const [hardware, setHardware] = useState<HardwareProfile | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getHardwareProfile()
+      .then((profile) => {
+        if (!cancelled) setHardware(profile);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -85,13 +100,22 @@ export function ModelsView({
   );
 
   const downloadQuant = useCallback(
-    async (model: HfModel, quant: HfQuant, mmproj?: HfMmprojFile) => {
+    async (
+      model: HfModel,
+      quant: HfQuant,
+      mmproj?: HfMmprojFile,
+      autoCompile = false,
+    ) => {
       const files = quant.files.map((file) => ({
         path: file.path,
         size: file.size,
       }));
       if (mmproj) files.push({ path: mmproj.path, size: mmproj.size });
-      return onStart({ repo: model.id, files });
+      return onStart({
+        repo: model.id,
+        files,
+        auto_compile: autoCompile,
+      });
     },
     [onStart],
   );
@@ -203,8 +227,12 @@ export function ModelsView({
           model={selected}
           modelsDir={settings?.models_dir ?? "models"}
           downloads={downloads}
+          hardware={hardware}
+          contextSize={settings?.llama_ctx_size ?? null}
           onClose={() => setSelected(null)}
-          onDownload={(quant, mmproj) => downloadQuant(selected, quant, mmproj)}
+          onDownload={(quant, mmproj, autoCompile) =>
+            downloadQuant(selected, quant, mmproj, autoCompile)
+          }
           onPause={(id) => void onPause(id)}
           onResume={(id) => void onResume(id)}
           onCancel={(id) => void onCancel(id)}

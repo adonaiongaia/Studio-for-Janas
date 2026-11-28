@@ -1287,7 +1287,9 @@ fn detect_vulkan() -> Option<GpuInfo> {
     })
 }
 
-fn run_short(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+/// Run a short, best-effort probe command and return its combined output.
+/// Shared with the fit estimator's `nvidia-smi` VRAM fallback.
+pub(crate) fn run_short(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
     let mut command = Command::new(program);
     command
         .args(args)

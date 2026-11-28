@@ -59,6 +59,9 @@ pub struct GgufModelInfo {
 pub struct GgufFeatures {
     pub name: Option<String>,
     pub chat_template: Option<String>,
+    /// `<architecture>.block_count`, carried along so the fit estimator does
+    /// not have to open the file again.
+    pub layer_count: Option<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -136,6 +139,7 @@ pub fn features(path: &str) -> Option<GgufFeatures> {
     Some(GgufFeatures {
         name: metadata.name,
         chat_template: metadata.chat_template,
+        layer_count: metadata.layer_count,
     })
 }
 
